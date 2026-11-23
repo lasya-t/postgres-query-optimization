@@ -6,6 +6,8 @@ A case file in cases/ has four sections:
     -- fix    DDL that enables the faster plan (indexes); may be empty for pure rewrites
     -- fast   the improved query (often the same text as slow)
     -- undo   DDL that removes the fix, so the lab can be re-run from scratch
+    -- check  (optional) a query whose rows must equal the fast query's, used when
+              the slow query times out and can't be compared directly
 
 Timings come from EXPLAIN (ANALYZE, BUFFERS): best of N runs, so the cache is warm for both.
 Both versions must return the same rows (compared by a hash of the sorted result).
@@ -31,6 +33,7 @@ class Measure:
     ms: float
     buffers: int
     nodes: list[str]
+    timed_out: bool = False
 
 
 @dataclass
@@ -42,9 +45,9 @@ class CaseResult:
 
 
 def parse_case(path: Path) -> dict[str, str]:
-    parts = re.split(r"^-- (slow|fix|fast|undo)\s*$", path.read_text(), flags=re.M)
+    parts = re.split(r"^-- (slow|fix|fast|undo|check)\s*$", path.read_text(), flags=re.M)
     sections = {parts[i]: parts[i + 1].strip() for i in range(1, len(parts), 2)}
-    missing = {"slow", "fix", "fast", "undo"} - sections.keys()
+    missing = {"slow", "fix", "fast", "undo"} - sections.keys()  # check is optional
     if missing:
         raise ValueError(f"{path.name} missing sections: {missing}")
     return sections
@@ -57,10 +60,15 @@ def _nodes(plan: dict) -> list[str]:
     return out
 
 
-def measure(cur, sql: str, runs: int = 3) -> Measure:
+def measure(cur, sql: str, runs: int = 3, timeout_ms: int = 30_000) -> Measure:
     best = None
+    cur.execute(f"SET statement_timeout = {timeout_ms}")
     for _ in range(runs):
-        cur.execute(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}")
+        try:
+            cur.execute(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}")
+        except psycopg.errors.QueryCanceled:
+            cur.execute(f"EXPLAIN (FORMAT JSON) {sql}")  # plan only, no timing
+            return Measure(float(timeout_ms), 0, _nodes(cur.fetchone()[0][0]["Plan"]), timed_out=True)
         plan = cur.fetchone()[0][0]
         top = plan["Plan"]
         m = Measure(plan["Execution Time"], top.get("Shared Hit Blocks", 0) + top.get("Shared Read Blocks", 0), _nodes(top))
@@ -75,17 +83,22 @@ def result_hash(cur, sql: str) -> str:
     return hashlib.sha256("\n".join(rows).encode()).hexdigest()
 
 
-def run_case(conn, path: Path, runs: int = 3) -> CaseResult:
+def run_case(conn, path: Path, runs: int = 3, timeout_ms: int = 30_000) -> CaseResult:
     c = parse_case(path)
     with conn.cursor() as cur:
         if c["undo"]:
             cur.execute(c["undo"])
-        slow = measure(cur, c["slow"], runs)
-        slow_hash = result_hash(cur, c["slow"])
+        slow = measure(cur, c["slow"], runs, timeout_ms)
+        if slow.timed_out:
+            if not c.get("check"):
+                raise ValueError(f"{path.name}: slow query timed out and there is no -- check section")
+            reference = result_hash(cur, c["check"])
+        else:
+            reference = result_hash(cur, c["slow"])
         if c["fix"]:
             cur.execute(c["fix"])
-        fast = measure(cur, c["fast"], runs)
-        same = result_hash(cur, c["fast"]) == slow_hash
+        fast = measure(cur, c["fast"], runs, timeout_ms)
+        same = result_hash(cur, c["fast"]) == reference
     return CaseResult(path.stem, slow, fast, same)
 
 
@@ -93,6 +106,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--only", help="run cases whose name contains this")
     p.add_argument("--runs", type=int, default=3)
+    p.add_argument("--timeout-ms", type=int, default=30_000)
     p.add_argument("--json", help="write results to this file")
     args = p.parse_args()
 
@@ -101,12 +115,15 @@ def main():
         for path in sorted(CASES.glob("*.sql")):
             if args.only and args.only not in path.stem:
                 continue
-            r = run_case(conn, path, args.runs)
+            r = run_case(conn, path, args.runs, args.timeout_ms)
             results.append(r)
             print(f"\n{r.name}")
-            print(f"  before {r.slow.ms:9.2f} ms  {r.slow.buffers:>8,} buffers  {' > '.join(r.slow.nodes[:3])}")
+            flag = ">" if r.slow.timed_out else " "
+            print(f"  before{flag}{r.slow.ms:9.2f} ms  {r.slow.buffers:>8,} buffers  {' > '.join(r.slow.nodes[:3])}")
             print(f"  after  {r.fast.ms:9.2f} ms  {r.fast.buffers:>8,} buffers  {' > '.join(r.fast.nodes[:3])}")
-            print(f"  {r.slow.ms / max(r.fast.ms, 0.001):,.0f}x faster, same rows: {r.same_rows}")
+            speed = f"{r.slow.ms / max(r.fast.ms, 0.001):,.0f}x"
+            print(f"  {'more than ' if r.slow.timed_out else ''}{speed} faster, same rows: {r.same_rows}"
+                  + (" (checked against reference query; slow one timed out)" if r.slow.timed_out else ""))
     if args.json:
         Path(args.json).write_text(json.dumps([r.__dict__ | {"slow": r.slow.__dict__, "fast": r.fast.__dict__} for r in results], indent=2))
 
