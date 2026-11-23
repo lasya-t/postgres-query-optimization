@@ -91,10 +91,26 @@ def run_script(cur, script: str) -> None:
             cur.execute(stmt)
 
 
+RESET_SQL = """
+SELECT format('DROP INDEX IF EXISTS %I.%I', schemaname, indexname)
+FROM pg_indexes
+WHERE schemaname = 'public'
+  AND indexname NOT IN (SELECT conname FROM pg_constraint WHERE contype IN ('p', 'u'))
+"""
+
+
+def reset_indexes(cur) -> None:
+    """Drop every index except primary keys, so each case starts from the same untuned schema."""
+    cur.execute(RESET_SQL)
+    for (stmt,) in cur.fetchall():
+        cur.execute(stmt)
+
+
 def run_case(conn, path: Path, runs: int = 3, timeout_ms: int = 30_000) -> CaseResult:
     c = parse_case(path)
     with conn.cursor() as cur:
         cur.execute("SET statement_timeout = 0")
+        reset_indexes(cur)
         run_script(cur, c["undo"])
         slow = measure(cur, c["slow"], runs, timeout_ms)
         if slow.timed_out:
