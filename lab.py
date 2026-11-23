@@ -83,11 +83,19 @@ def result_hash(cur, sql: str) -> str:
     return hashlib.sha256("\n".join(rows).encode()).hexdigest()
 
 
+def run_script(cur, script: str) -> None:
+    # one statement at a time: several in one call run as a single transaction,
+    # and some commands (VACUUM, CREATE INDEX CONCURRENTLY) refuse to run inside one
+    for stmt in (s.strip() for s in script.split(";")):
+        if stmt:
+            cur.execute(stmt)
+
+
 def run_case(conn, path: Path, runs: int = 3, timeout_ms: int = 30_000) -> CaseResult:
     c = parse_case(path)
     with conn.cursor() as cur:
-        if c["undo"]:
-            cur.execute(c["undo"])
+        cur.execute("SET statement_timeout = 0")
+        run_script(cur, c["undo"])
         slow = measure(cur, c["slow"], runs, timeout_ms)
         if slow.timed_out:
             if not c.get("check"):
@@ -95,8 +103,8 @@ def run_case(conn, path: Path, runs: int = 3, timeout_ms: int = 30_000) -> CaseR
             reference = result_hash(cur, c["check"])
         else:
             reference = result_hash(cur, c["slow"])
-        if c["fix"]:
-            cur.execute(c["fix"])
+        cur.execute("SET statement_timeout = 0")
+        run_script(cur, c["fix"])
         fast = measure(cur, c["fast"], runs, timeout_ms)
         same = result_hash(cur, c["fast"]) == reference
     return CaseResult(path.stem, slow, fast, same)
